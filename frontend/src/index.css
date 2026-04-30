@@ -1,0 +1,115 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: linear-gradient(90deg, #5b97c9 0%, #74b2df 36%, #9fd0ef 68%, #cfeaff 100%);
+  color: #14213d;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+body::before,
+body::after {
+  content: "";
+  position: fixed;
+  inset: -15% -10%;
+  pointer-events: none;
+  z-index: -1;
+}
+
+body::after,
+body::before {
+  will-change: transform, opacity, filter;
+}
+
+body::before,
+body::after,
+html::before {
+  pointer-events: none;
+}
+
+html::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background:
+    linear-gradient(
+      102deg,
+      transparent 0%,
+      transparent 41%,
+      rgba(235, 249, 255, 0.08) 48%,
+      rgba(255, 255, 255, 0.26) 50%,
+      rgba(235, 249, 255, 0.08) 52%,
+      transparent 59%,
+      transparent 100%
+    );
+  background-size: 220% 100%;
+  animation: oceanHighlightSweep 9s linear infinite;
+  mix-blend-mode: screen;
+}
+
+body::before {
+  background:
+    radial-gradient(600px 260px at 15% 28%, rgba(255, 255, 255, 0.62), transparent 66%),
+    radial-gradient(720px 300px at 80% 72%, rgba(224, 245, 255, 0.46), transparent 72%);
+  animation: oceanDriftA 7s ease-in-out infinite alternate;
+}
+
+body::after {
+  background:
+    radial-gradient(860px 340px at 35% 84%, rgba(110, 184, 238, 0.35), transparent 75%),
+    radial-gradient(920px 360px at 78% 22%, rgba(83, 165, 226, 0.32), transparent 74%);
+  animation: oceanDriftB 10s ease-in-out infinite alternate;
+}
+
+body {
+  animation: oceanTintShift 14s ease-in-out infinite alternate;
+}
+
+@keyframes oceanDriftA {
+  from {
+    transform: translate3d(-5%, -3%, 0) scale(1);
+  }
+  to {
+    transform: translate3d(6%, 4%, 0) scale(1.14);
+  }
+}
+
+@keyframes oceanDriftB {
+  from {
+    transform: translate3d(6%, -3%, 0) scale(1.08);
+  }
+  to {
+    transform: translate3d(-6%, 5%, 0) scale(0.98);
+  }
+}
+
+@keyframes oceanTintShift {
+  0% {
+    filter: saturate(1) brightness(0.97);
+  }
+  50% {
+    filter: saturate(1.08) brightness(1);
+  }
+  100% {
+    filter: saturate(0.95) brightness(0.94);
+  }
+}
+
+@keyframes oceanHighlightSweep {
+  from {
+    background-position: -120% 0;
+    opacity: 0.2;
+  }
+  45% {
+    opacity: 0.55;
+  }
+  to {
+    background-position: 120% 0;
+    opacity: 0.2;
+  }
+}
