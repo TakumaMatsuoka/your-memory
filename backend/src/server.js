@@ -4,6 +4,8 @@ const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
+const nodemailer = require("nodemailer");
 const { z } = require("zod");
 const db = require("./db");
 const { authMiddleware, signToken } = require("./auth");
@@ -54,10 +56,14 @@ const authLimiter = rateLimit({
 app.use("/auth", authLimiter);
 app.use(apiLimiter);
 
-const registerSchema = z.object({
+const registerRequestSchema = z.object({
   email: z.string().email(),
   password: z.string().min(8),
-  birthDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+});
+
+const registerVerifySchema = z.object({
+  email: z.string().email(),
+  code: z.string().regex(/^\d{6}$/),
 });
 
 const loginSchema = z.object({
@@ -65,9 +71,69 @@ const loginSchema = z.object({
   password: z.string().min(8),
 });
 
+const accountUpdateSchema = z.object({
+  username: z.string().min(2).max(32).regex(/^[a-zA-Z0-9_]+$/),
+  birthDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+});
+
+const accountEmailSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+});
+
+const accountDeleteSchema = z.object({
+  password: z.string().min(8),
+});
+
+const pendingRegisterMap = new Map();
+const registerCodeTtlMs = 10 * 60 * 1000;
+
+function buildMailer() {
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    return null;
+  }
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || "false") === "true",
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+}
+
+async function sendVerificationEmail(email, code) {
+  const transporter = buildMailer();
+  if (!transporter) {
+    console.log(`[register-code] ${email}: ${code}`);
+    return false;
+  }
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: email,
+    subject: "Your Memory 認証コード",
+    text: `認証コード: ${code}\n有効期限は10分です。`,
+  });
+  return true;
+}
+
+function generateUniqueUsername(email) {
+  const base = email.split("@")[0].toLowerCase().replace(/[^a-z0-9_]/g, "") || "user";
+  let candidate = base.slice(0, 24);
+  let suffix = 0;
+  while (true) {
+    const username = suffix === 0 ? candidate : `${candidate}${suffix}`;
+    const existing = db.prepare("SELECT id FROM users WHERE username = ?").get(username);
+    if (!existing) return username;
+    suffix += 1;
+  }
+}
+
 const memorySchema = z.object({
+  trackId: z.number().int().min(1).max(10).optional().default(1),
   title: z.string().min(1).max(120),
-  photoUrl: z.string().url().optional().or(z.literal("")),
+  photoUrl: z.string().max(2000).optional().or(z.literal("")),
   content: z.string().min(1).max(5000),
   people: z.string().max(300).optional().or(z.literal("")),
   labels: z.array(z.string().min(1).max(40)).max(20),
@@ -79,26 +145,59 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/auth/register", (req, res) => {
-  const parsed = registerSchema.safeParse(req.body);
+app.post("/auth/register/request-code", async (req, res) => {
+  const parsed = registerRequestSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ message: "入力内容が不正です。" });
   }
-
-  const { email, password, birthDate } = parsed.data;
+  const { email, password } = parsed.data;
   const existing = db
     .prepare("SELECT id FROM users WHERE email = ?")
     .get(email.toLowerCase());
   if (existing) {
     return res.status(409).json({ message: "そのメールアドレスは既に使用されています。" });
   }
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  pendingRegisterMap.set(email.toLowerCase(), {
+    passwordHash: bcrypt.hashSync(password, 10),
+    code,
+    expiresAt: Date.now() + registerCodeTtlMs,
+  });
+  try {
+    const sent = await sendVerificationEmail(email.toLowerCase(), code);
+    const body = { ok: true, message: "認証コードを送信しました。" };
+    if (!sent && !isProd) {
+      body.debugCode = code;
+    }
+    return res.json(body);
+  } catch (_e) {
+    return res.status(500).json({ message: "認証コードの送信に失敗しました。" });
+  }
+});
 
-  const passwordHash = bcrypt.hashSync(password, 10);
+app.post("/auth/register/verify-code", (req, res) => {
+  const parsed = registerVerifySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "入力内容が不正です。" });
+  }
+  const { email, code } = parsed.data;
+  const normalizedEmail = email.toLowerCase();
+  const pending = pendingRegisterMap.get(normalizedEmail);
+  if (!pending || pending.expiresAt < Date.now() || pending.code !== code) {
+    return res.status(400).json({ message: "認証コードが不正、または期限切れです。" });
+  }
+  const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(normalizedEmail);
+  if (existing) {
+    pendingRegisterMap.delete(normalizedEmail);
+    return res.status(409).json({ message: "そのメールアドレスは既に使用されています。" });
+  }
+  const birthDate = new Date().toISOString().slice(0, 10);
+  const username = generateUniqueUsername(normalizedEmail);
   const result = db
-    .prepare("INSERT INTO users (email, birth_date, password_hash) VALUES (?, ?, ?)")
-    .run(email.toLowerCase(), birthDate, passwordHash);
-
-  const user = { id: result.lastInsertRowid, email: email.toLowerCase(), birthDate };
+    .prepare("INSERT INTO users (username, email, birth_date, password_hash) VALUES (?, ?, ?, ?)")
+    .run(username, normalizedEmail, birthDate, pending.passwordHash);
+  pendingRegisterMap.delete(normalizedEmail);
+  const user = { id: result.lastInsertRowid, username, email: normalizedEmail, birthDate };
   const token = signToken(user);
   return res.status(201).json({ token, user });
 });
@@ -111,7 +210,7 @@ app.post("/auth/login", (req, res) => {
 
   const { email, password } = parsed.data;
   const user = db
-    .prepare("SELECT id, email, birth_date, password_hash FROM users WHERE email = ?")
+    .prepare("SELECT id, username, email, birth_date, password_hash FROM users WHERE email = ?")
     .get(email.toLowerCase());
 
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
@@ -119,7 +218,10 @@ app.post("/auth/login", (req, res) => {
   }
 
   const token = signToken(user);
-  return res.json({ token, user: { id: user.id, email: user.email, birthDate: user.birth_date } });
+  return res.json({
+    token,
+    user: { id: user.id, username: user.username, email: user.email, birthDate: user.birth_date },
+  });
 });
 
 app.get("/memories", authMiddleware, (req, res) => {
@@ -127,13 +229,14 @@ app.get("/memories", authMiddleware, (req, res) => {
   const q = (req.query.q || "").toString().trim().toLowerCase();
   const label = (req.query.label || "").toString().trim().toLowerCase();
   const user = db
-    .prepare("SELECT birth_date FROM users WHERE id = ?")
+    .prepare("SELECT username, birth_date FROM users WHERE id = ?")
     .get(req.user.id);
   const birthDate = user?.birth_date || null;
 
   let rows = db
     .prepare(
       `SELECT id, title, photo_url, content, people, labels, important, memory_date
+       , track_id
        FROM memories
        WHERE user_id = ?
        ORDER BY memory_date ASC, id ASC`
@@ -142,6 +245,7 @@ app.get("/memories", authMiddleware, (req, res) => {
 
   rows = rows.map((row) => ({
     id: row.id,
+    trackId: row.track_id || 1,
     title: row.title,
     photoUrl: row.photo_url,
     content: row.content,
@@ -166,7 +270,76 @@ app.get("/memories", authMiddleware, (req, res) => {
     );
   }
 
-  return res.json({ memories: rows, user: { birthDate } });
+  return res.json({ memories: rows, user: { birthDate, username: user?.username || null } });
+});
+
+app.get("/account", authMiddleware, (req, res) => {
+  const user = db
+    .prepare("SELECT id, username, email, birth_date FROM users WHERE id = ?")
+    .get(req.user.id);
+  if (!user) {
+    return res.status(404).json({ message: "アカウントが見つかりません。" });
+  }
+  return res.json({
+    user: { id: user.id, username: user.username, email: user.email, birthDate: user.birth_date || "" },
+  });
+});
+
+app.put("/account", authMiddleware, (req, res) => {
+  const parsed = accountUpdateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "入力内容が不正です。" });
+  }
+  const { username, birthDate } = parsed.data;
+  const duplicate = db
+    .prepare("SELECT id FROM users WHERE username = ? AND id <> ?")
+    .get(username.toLowerCase(), req.user.id);
+  if (duplicate) {
+    return res.status(409).json({ message: "そのログイン名は既に使用されています。" });
+  }
+  db.prepare("UPDATE users SET username = ?, birth_date = ? WHERE id = ?").run(
+    username.toLowerCase(),
+    birthDate,
+    req.user.id
+  );
+  return res.json({ ok: true });
+});
+
+app.put("/account/email", authMiddleware, (req, res) => {
+  const parsed = accountEmailSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "入力内容が不正です。" });
+  }
+  const { email, password } = parsed.data;
+  const user = db
+    .prepare("SELECT id, password_hash FROM users WHERE id = ?")
+    .get(req.user.id);
+  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    return res.status(401).json({ message: "パスワードが違います。" });
+  }
+  const duplicate = db
+    .prepare("SELECT id FROM users WHERE email = ? AND id <> ?")
+    .get(email.toLowerCase(), req.user.id);
+  if (duplicate) {
+    return res.status(409).json({ message: "そのメールアドレスは既に使用されています。" });
+  }
+  db.prepare("UPDATE users SET email = ? WHERE id = ?").run(email.toLowerCase(), req.user.id);
+  return res.json({ ok: true, email: email.toLowerCase() });
+});
+
+app.delete("/account", authMiddleware, (req, res) => {
+  const parsed = accountDeleteSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "入力内容が不正です。" });
+  }
+  const user = db
+    .prepare("SELECT id, password_hash FROM users WHERE id = ?")
+    .get(req.user.id);
+  if (!user || !bcrypt.compareSync(parsed.data.password, user.password_hash)) {
+    return res.status(401).json({ message: "パスワードが違います。" });
+  }
+  db.prepare("DELETE FROM users WHERE id = ?").run(req.user.id);
+  return res.json({ ok: true });
 });
 
 app.post("/memories", authMiddleware, (req, res) => {
@@ -175,15 +348,16 @@ app.post("/memories", authMiddleware, (req, res) => {
     return res.status(400).json({ message: "入力内容が不正です。" });
   }
 
-  const { title, photoUrl, content, people, labels, important, memoryDate } = parsed.data;
+  const { trackId, title, photoUrl, content, people, labels, important, memoryDate } = parsed.data;
 
   const result = db
     .prepare(
-      `INSERT INTO memories (user_id, title, photo_url, content, people, labels, important, memory_date)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO memories (user_id, track_id, title, photo_url, content, people, labels, important, memory_date)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       req.user.id,
+      trackId,
       title.trim(),
       photoUrl || null,
       content.trim(),
@@ -214,12 +388,13 @@ app.put("/memories/:id", authMiddleware, (req, res) => {
     return res.status(404).json({ message: "思い出が見つかりません。" });
   }
 
-  const { title, photoUrl, content, people, labels, important, memoryDate } = parsed.data;
+  const { trackId, title, photoUrl, content, people, labels, important, memoryDate } = parsed.data;
   db.prepare(
     `UPDATE memories
-     SET title = ?, photo_url = ?, content = ?, people = ?, labels = ?, important = ?, memory_date = ?
+     SET track_id = ?, title = ?, photo_url = ?, content = ?, people = ?, labels = ?, important = ?, memory_date = ?
      WHERE id = ? AND user_id = ?`
   ).run(
+    trackId,
     title.trim(),
     photoUrl || null,
     content.trim(),

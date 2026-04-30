@@ -214,8 +214,8 @@ select {
 
 .timeline {
   position: relative;
-  min-height: 260px;
-  --line-y: 110px;
+  min-height: 300px;
+  --line-y: 148px;
   transition: opacity 0.4s ease;
 }
 
@@ -247,14 +247,30 @@ select {
 .line {
   position: absolute;
   top: var(--line-y);
-  left: 22px;
-  right: 22px;
+  left: var(--line-start, 4%);
+  right: 4%;
   height: 2px;
   background: var(--line-color, #2d3748);
   transform: translateY(-50%) scaleX(0);
   transform-origin: left center;
   opacity: 0.2;
   transition: transform 1.6s steps(24, end), opacity 1.6s ease;
+}
+
+.date-crosshair {
+  position: absolute;
+  top: 26px;
+  bottom: 18px;
+  width: 1px;
+  background: linear-gradient(
+    to bottom,
+    rgba(47, 100, 216, 0.05),
+    rgba(47, 100, 216, 0.55),
+    rgba(47, 100, 216, 0.05)
+  );
+  transform: translateX(-50%);
+  pointer-events: none;
+  z-index: 1;
 }
 
 .timeline.show-line .line {
@@ -268,6 +284,7 @@ select {
 
 .timeline-stack-card {
   padding: 12px;
+  overflow: hidden;
 }
 
 .timeline-stack {
@@ -277,6 +294,7 @@ select {
   max-height: 78vh;
   overflow-y: auto;
   padding-right: 6px;
+  padding-top: 14px;
 }
 
 .track-title {
@@ -504,6 +522,21 @@ select {
   padding: 0;
 }
 
+.color-control input[type="date"] {
+  width: 150px;
+  height: auto;
+  padding: 5px 6px;
+}
+
+.birth-node .dot {
+  background: #2f64d8;
+  box-shadow: 0 0 0 2px rgba(47, 100, 216, 0.25);
+}
+
+.birth-node {
+  top: var(--line-y);
+}
+
 .search.preview {
   margin-bottom: 0;
   cursor: pointer;
@@ -708,8 +741,12 @@ select {
 }
 
 .empty {
-  margin-top: 10px;
+  position: absolute;
+  top: 10px;
+  left: 22px;
+  margin: 0;
   color: #6b7280;
+  z-index: 1;
 }
 
 .message {
