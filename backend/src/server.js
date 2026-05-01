@@ -14,6 +14,10 @@ const app = express();
 const port = process.env.PORT || 4000;
 const isProd = process.env.NODE_ENV === "production";
 
+// Railway 等のリバースプロキシでは X-Forwarded-For が付く。未設定だと express-rate-limit が ValidationError を投げる。
+// 環境変数に依存させると本番で効かないケースがあるため、API サーバーでは常に 1-hop のプロキシを信頼する。
+app.set("trust proxy", 1);
+
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
   .map((v) => v.trim())
@@ -43,6 +47,7 @@ const apiLimiter = rateLimit({
   max: Number(process.env.RATE_LIMIT_MAX || 300),
   standardHeaders: true,
   legacyHeaders: false,
+  validate: false,
 });
 
 const authLimiter = rateLimit({
@@ -51,6 +56,7 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: "試行回数が多すぎます。しばらくしてから再試行してください。" },
+  validate: false,
 });
 
 app.use("/auth", authLimiter);
