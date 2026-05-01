@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const dns = require("dns");
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
@@ -13,6 +14,11 @@ const { authMiddleware, signToken } = require("./auth");
 const app = express();
 const port = process.env.PORT || 4000;
 const isProd = process.env.NODE_ENV === "production";
+
+// Railway 環境で SMTP 接続先が IPv6 を返すと ENETUNREACH になるケースがあるため IPv4 優先にする。
+if (typeof dns.setDefaultResultOrder === "function") {
+  dns.setDefaultResultOrder("ipv4first");
+}
 
 // Railway 等のリバースプロキシでは X-Forwarded-For が付く。未設定だと express-rate-limit が ValidationError を投げる。
 // 環境変数に依存させると本番で効かないケースがあるため、API サーバーでは常に 1-hop のプロキシを信頼する。
