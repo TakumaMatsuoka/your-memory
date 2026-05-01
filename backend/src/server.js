@@ -109,6 +109,7 @@ function buildMailer() {
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
     secure: String(process.env.SMTP_SECURE || "false") === "true",
+    family: 4,
     connectionTimeout: smtpTimeoutMs,
     greetingTimeout: smtpTimeoutMs,
     socketTimeout: smtpTimeoutMs,
