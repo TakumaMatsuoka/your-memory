@@ -98,10 +98,14 @@ function buildMailer() {
   if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
     return null;
   }
+  const smtpTimeoutMs = Number(process.env.SMTP_TIMEOUT_MS || 15000);
   return nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
     secure: String(process.env.SMTP_SECURE || "false") === "true",
+    connectionTimeout: smtpTimeoutMs,
+    greetingTimeout: smtpTimeoutMs,
+    socketTimeout: smtpTimeoutMs,
     auth: {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASS,
@@ -176,7 +180,8 @@ app.post("/auth/register/request-code", async (req, res) => {
       body.debugCode = code;
     }
     return res.json(body);
-  } catch (_e) {
+  } catch (e) {
+    console.error("[register-code] send failed:", e?.message || e);
     return res.status(500).json({ message: "認証コードの送信に失敗しました。" });
   }
 });
