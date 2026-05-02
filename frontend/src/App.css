@@ -378,6 +378,40 @@ select {
   color: #4a5f7a;
 }
 
+.auth-test-notice {
+  max-width: 520px;
+  margin: 0 auto 14px;
+  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #2a3d5c;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(120, 160, 210, 0.45);
+  border-radius: 10px;
+}
+
+.auth-test-notice strong {
+  font-weight: 700;
+}
+
+.metrics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  margin-top: 10px;
+}
+
+.metrics-table th,
+.metrics-table td {
+  border: 1px solid #ccd4e3;
+  padding: 6px 8px;
+  text-align: left;
+}
+
+.metrics-table th {
+  background: rgba(239, 248, 255, 0.9);
+}
+
 .auth-switch {
   margin: 2px 0 0;
   font-size: 13px;

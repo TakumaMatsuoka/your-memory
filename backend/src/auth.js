@@ -7,7 +7,7 @@ if (process.env.NODE_ENV === "production" && (!process.env.JWT_SECRET || process
 }
 
 function signToken(user) {
-  return jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, {
+  return jwt.sign({ sub: user.id, u: user.username }, JWT_SECRET, {
     expiresIn: "7d",
   });
 }
@@ -24,7 +24,10 @@ function authMiddleware(req, res, next) {
 
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    req.user = { id: payload.sub, email: payload.email };
+    req.user = {
+      id: payload.sub,
+      username: typeof payload.u === "string" ? payload.u : "",
+    };
     return next();
   } catch (_error) {
     return res.status(401).json({ message: "認証トークンが無効です。" });

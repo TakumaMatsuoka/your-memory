@@ -1,13 +1,9 @@
 require("dotenv").config();
 
-const dns = require("dns");
-const net = require("net");
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const bcrypt = require("bcryptjs");
-const crypto = require("crypto");
-const nodemailer = require("nodemailer");
 const { z } = require("zod");
 const db = require("./db");
 const { authMiddleware, signToken } = require("./auth");
@@ -15,11 +11,6 @@ const { authMiddleware, signToken } = require("./auth");
 const app = express();
 const port = process.env.PORT || 4000;
 const isProd = process.env.NODE_ENV === "production";
-
-// Railway 環境で SMTP 接続先が IPv6 を返すと ENETUNREACH になるケースがあるため IPv4 優先にする。
-if (typeof dns.setDefaultResultOrder === "function") {
-  dns.setDefaultResultOrder("ipv4first");
-}
 
 // Railway 等のリバースプロキシでは X-Forwarded-For が付く。未設定だと express-rate-limit が ValidationError を投げる。
 // 環境変数に依存させると本番で効かないケースがあるため、API サーバーでは常に 1-hop のプロキシを信頼する。
@@ -59,7 +50,7 @@ const apiLimiter = rateLimit({
 
 const authLimiter = rateLimit({
   windowMs: Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000),
-  max: Number(process.env.AUTH_RATE_LIMIT_MAX || 10),
+  max: Number(process.env.AUTH_RATE_LIMIT_MAX || 5),
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: "試行回数が多すぎます。しばらくしてから再試行してください。" },
@@ -69,19 +60,16 @@ const authLimiter = rateLimit({
 app.use("/auth", authLimiter);
 app.use(apiLimiter);
 
-const registerRequestSchema = z.object({
-  email: z.string().email(),
+const usernamePasswordSchema = z.object({
+  username: z.string().min(2).max(32).regex(/^[a-zA-Z0-9_]+$/),
   password: z.string().min(8),
+  recaptchaToken: z.string().optional(),
 });
 
-const registerVerifySchema = z.object({
-  email: z.string().email(),
-  code: z.string().regex(/^\d{6}$/),
-});
-
-const loginSchema = z.object({
-  email: z.string().email(),
+const loginIdentifierSchema = z.object({
+  username: z.string().min(1).max(320),
   password: z.string().min(8),
+  recaptchaToken: z.string().optional(),
 });
 
 const accountUpdateSchema = z.object({
@@ -89,85 +77,59 @@ const accountUpdateSchema = z.object({
   birthDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
 });
 
-const accountEmailSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(8),
-});
-
 const accountDeleteSchema = z.object({
   password: z.string().min(8),
 });
 
-const pendingRegisterMap = new Map();
-const registerCodeTtlMs = 10 * 60 * 1000;
-
-/**
- * Railway 等で IPv6 経路が使えず ENETUNREACH になるため、ホスト名は A レコードで IPv4 に解決してから接続する。
- * TLS 証明書検証用に servername は元のホスト名のまま渡す。
- */
-async function createSmtpTransporter() {
-  const rawHost = (process.env.SMTP_HOST || "").trim();
-  if (!rawHost || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
-    return null;
-  }
-  const smtpTimeoutMs = Number(process.env.SMTP_TIMEOUT_MS || 15000);
-  let connectHost = rawHost;
-  let servername = rawHost;
-
-  if (!net.isIP(rawHost)) {
-    try {
-      const v4 = await dns.promises.resolve4(rawHost);
-      if (v4?.length) {
-        connectHost = v4[0];
-        servername = rawHost;
-      }
-    } catch (err) {
-      console.warn("[smtp] resolve4 failed, connecting by hostname:", err?.message || err);
-    }
-  }
-
-  return nodemailer.createTransport({
-    host: connectHost,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: String(process.env.SMTP_SECURE || "false") === "true",
-    tls: {
-      servername,
-    },
-    connectionTimeout: smtpTimeoutMs,
-    greetingTimeout: smtpTimeoutMs,
-    socketTimeout: smtpTimeoutMs,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    },
-  });
+function internalPlaceholderEmail(usernameLower) {
+  return `${usernameLower}@noreply.local`;
 }
 
-async function sendVerificationEmail(email, code) {
-  const transporter = await createSmtpTransporter();
-  if (!transporter) {
-    console.log(`[register-code] ${email}: ${code}`);
+function isPlaceholderEmail(email) {
+  return typeof email === "string" && email.endsWith("@noreply.local");
+}
+
+/** daily_metrics の day は UTC の YYYY-MM-DD */
+function bumpDailyMetric(column) {
+  const allowed = ["registrations", "login_ok", "login_fail"];
+  if (!allowed.includes(column)) return;
+  const day = new Date().toISOString().slice(0, 10);
+  const row = db.prepare("SELECT 1 AS ok FROM daily_metrics WHERE day = ?").get(day);
+  if (row) {
+    db.prepare(`UPDATE daily_metrics SET ${column} = ${column} + 1 WHERE day = ?`).run(day);
+  } else {
+    const registrations = column === "registrations" ? 1 : 0;
+    const loginOk = column === "login_ok" ? 1 : 0;
+    const loginFail = column === "login_fail" ? 1 : 0;
+    db.prepare(
+      "INSERT INTO daily_metrics (day, registrations, login_ok, login_fail) VALUES (?,?,?,?)"
+    ).run(day, registrations, loginOk, loginFail);
+  }
+}
+
+async function verifyRecaptchaIfConfigured(token, remoteIp) {
+  const secret = (process.env.RECAPTCHA_SECRET_KEY || "").trim();
+  if (!secret) return true;
+  if (!token || typeof token !== "string") {
     return false;
   }
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to: email,
-    subject: "Your Memory 認証コード",
-    text: `認証コード: ${code}\n有効期限は10分です。`,
+  const minScore = Number(process.env.RECAPTCHA_MIN_SCORE || 0.3);
+  const params = new URLSearchParams({
+    secret,
+    response: token,
   });
-  return true;
-}
-
-function generateUniqueUsername(email) {
-  const base = email.split("@")[0].toLowerCase().replace(/[^a-z0-9_]/g, "") || "user";
-  let candidate = base.slice(0, 24);
-  let suffix = 0;
-  while (true) {
-    const username = suffix === 0 ? candidate : `${candidate}${suffix}`;
-    const existing = db.prepare("SELECT id FROM users WHERE username = ?").get(username);
-    if (!existing) return username;
-    suffix += 1;
+  if (remoteIp) params.append("remoteip", remoteIp);
+  const res = await fetch("https://www.google.com/recaptcha/api/siteverify", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+  const data = await res.json();
+  if (!data.success) return false;
+  if (data.score !== undefined && typeof data.score === "number" && data.score < minScore) {
+    return false;
   }
+  return true;
 }
 
 const memorySchema = z.object({
@@ -185,83 +147,99 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/auth/register/request-code", async (req, res) => {
-  const parsed = registerRequestSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ message: "入力内容が不正です。" });
-  }
-  const { email, password } = parsed.data;
-  const existing = db
-    .prepare("SELECT id FROM users WHERE email = ?")
-    .get(email.toLowerCase());
-  if (existing) {
-    return res.status(409).json({ message: "そのメールアドレスは既に使用されています。" });
-  }
-  const code = String(Math.floor(100000 + Math.random() * 900000));
-  pendingRegisterMap.set(email.toLowerCase(), {
-    passwordHash: bcrypt.hashSync(password, 10),
-    code,
-    expiresAt: Date.now() + registerCodeTtlMs,
-  });
-  try {
-    const sent = await sendVerificationEmail(email.toLowerCase(), code);
-    const body = { ok: true, message: "認証コードを送信しました。" };
-    if (!sent && !isProd) {
-      body.debugCode = code;
-    }
-    return res.json(body);
-  } catch (e) {
-    console.error("[register-code] send failed:", e?.message || e);
-    return res.status(500).json({ message: "認証コードの送信に失敗しました。" });
-  }
+app.get("/public/metrics", (_req, res) => {
+  const totalUsers = db.prepare("SELECT COUNT(*) AS c FROM users").get().c;
+  const days = db
+    .prepare(
+      "SELECT day, registrations, login_ok, login_fail FROM daily_metrics ORDER BY day DESC LIMIT 30"
+    )
+    .all()
+    .reverse();
+  return res.json({ totalUsers, days });
 });
 
-app.post("/auth/register/verify-code", (req, res) => {
-  const parsed = registerVerifySchema.safeParse(req.body);
+app.post("/auth/register", async (req, res) => {
+  const parsed = usernamePasswordSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ message: "入力内容が不正です。" });
   }
-  const { email, code } = parsed.data;
-  const normalizedEmail = email.toLowerCase();
-  const pending = pendingRegisterMap.get(normalizedEmail);
-  if (!pending || pending.expiresAt < Date.now() || pending.code !== code) {
-    return res.status(400).json({ message: "認証コードが不正、または期限切れです。" });
+  const username = parsed.data.username.toLowerCase();
+  const { password, recaptchaToken } = parsed.data;
+  const remoteIp = (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() || req.socket.remoteAddress;
+  try {
+    const ok = await verifyRecaptchaIfConfigured(recaptchaToken || "", remoteIp);
+    if (!ok) {
+      return res.status(400).json({ message: "ボット対策の検証に失敗しました。しばらくしてから再試行してください。" });
+    }
+  } catch (e) {
+    console.warn("[auth] recaptcha verify error:", e?.message || e);
+    return res.status(503).json({ message: "認証検証サービスに接続できませんでした。" });
   }
-  const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(normalizedEmail);
-  if (existing) {
-    pendingRegisterMap.delete(normalizedEmail);
-    return res.status(409).json({ message: "そのメールアドレスは既に使用されています。" });
+
+  const dupUser = db.prepare("SELECT id FROM users WHERE username = ?").get(username);
+  if (dupUser) {
+    return res.status(409).json({ message: "そのログイン名は既に使用されています。" });
   }
+  const placeholder = internalPlaceholderEmail(username);
+  const dupEmail = db.prepare("SELECT id FROM users WHERE email = ?").get(placeholder);
+  if (dupEmail) {
+    return res.status(409).json({ message: "そのログイン名は既に使用されています。" });
+  }
+
   const birthDate = new Date().toISOString().slice(0, 10);
-  const username = generateUniqueUsername(normalizedEmail);
+  const passwordHash = bcrypt.hashSync(password, 10);
   const result = db
     .prepare("INSERT INTO users (username, email, birth_date, password_hash) VALUES (?, ?, ?, ?)")
-    .run(username, normalizedEmail, birthDate, pending.passwordHash);
-  pendingRegisterMap.delete(normalizedEmail);
-  const user = { id: result.lastInsertRowid, username, email: normalizedEmail, birthDate };
+    .run(username, placeholder, birthDate, passwordHash);
+  bumpDailyMetric("registrations");
+  const user = {
+    id: result.lastInsertRowid,
+    username,
+    birthDate,
+  };
   const token = signToken(user);
-  return res.status(201).json({ token, user });
+  console.log(`[auth] register ok user_id=${user.id} username=${username}`);
+  return res.status(201).json({ token, user: { ...user, email: null } });
 });
 
-app.post("/auth/login", (req, res) => {
-  const parsed = loginSchema.safeParse(req.body);
+app.post("/auth/login", async (req, res) => {
+  const parsed = loginIdentifierSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ message: "入力内容が不正です。" });
   }
-
-  const { email, password } = parsed.data;
-  const user = db
-    .prepare("SELECT id, username, email, birth_date, password_hash FROM users WHERE email = ?")
-    .get(email.toLowerCase());
-
-  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-    return res.status(401).json({ message: "メールアドレスまたはパスワードが違います。" });
+  const identifier = parsed.data.username.trim().toLowerCase();
+  const { password, recaptchaToken } = parsed.data;
+  const remoteIp = (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() || req.socket.remoteAddress;
+  try {
+    const ok = await verifyRecaptchaIfConfigured(recaptchaToken || "", remoteIp);
+    if (!ok) {
+      return res.status(400).json({ message: "ボット対策の検証に失敗しました。しばらくしてから再試行してください。" });
+    }
+  } catch (e) {
+    console.warn("[auth] recaptcha verify error:", e?.message || e);
+    return res.status(503).json({ message: "認証検証サービスに接続できませんでした。" });
   }
 
+  const user = db
+    .prepare(
+      `SELECT id, username, email, birth_date, password_hash FROM users
+       WHERE lower(username) = ? OR lower(email) = ?`
+    )
+    .get(identifier, identifier);
+
+  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    bumpDailyMetric("login_fail");
+    console.warn("[auth] login_fail", { identifier: identifier.slice(0, 64) });
+    return res.status(401).json({ message: "ログイン名またはパスワードが違います。" });
+  }
+
+  bumpDailyMetric("login_ok");
   const token = signToken(user);
+  console.log(`[auth] login_ok user_id=${user.id}`);
+  const emailOut = isPlaceholderEmail(user.email) ? null : user.email;
   return res.json({
     token,
-    user: { id: user.id, username: user.username, email: user.email, birthDate: user.birth_date },
+    user: { id: user.id, username: user.username, email: emailOut, birthDate: user.birth_date },
   });
 });
 
@@ -321,8 +299,9 @@ app.get("/account", authMiddleware, (req, res) => {
   if (!user) {
     return res.status(404).json({ message: "アカウントが見つかりません。" });
   }
+  const emailOut = isPlaceholderEmail(user.email) ? null : user.email;
   return res.json({
-    user: { id: user.id, username: user.username, email: user.email, birthDate: user.birth_date || "" },
+    user: { id: user.id, username: user.username, email: emailOut, birthDate: user.birth_date || "" },
   });
 });
 
@@ -332,40 +311,30 @@ app.put("/account", authMiddleware, (req, res) => {
     return res.status(400).json({ message: "入力内容が不正です。" });
   }
   const { username, birthDate } = parsed.data;
+  const usernameLower = username.toLowerCase();
   const duplicate = db
     .prepare("SELECT id FROM users WHERE username = ? AND id <> ?")
-    .get(username.toLowerCase(), req.user.id);
+    .get(usernameLower, req.user.id);
   if (duplicate) {
     return res.status(409).json({ message: "そのログイン名は既に使用されています。" });
   }
-  db.prepare("UPDATE users SET username = ?, birth_date = ? WHERE id = ?").run(
-    username.toLowerCase(),
+  const row = db.prepare("SELECT email FROM users WHERE id = ?").get(req.user.id);
+  const nextEmail = isPlaceholderEmail(row?.email)
+    ? internalPlaceholderEmail(usernameLower)
+    : row?.email;
+  if (isPlaceholderEmail(row?.email)) {
+    const dupPh = db.prepare("SELECT id FROM users WHERE email = ? AND id <> ?").get(nextEmail, req.user.id);
+    if (dupPh) {
+      return res.status(409).json({ message: "そのログイン名は既に使用されています。" });
+    }
+  }
+  db.prepare("UPDATE users SET username = ?, birth_date = ?, email = ? WHERE id = ?").run(
+    usernameLower,
     birthDate,
+    nextEmail,
     req.user.id
   );
   return res.json({ ok: true });
-});
-
-app.put("/account/email", authMiddleware, (req, res) => {
-  const parsed = accountEmailSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ message: "入力内容が不正です。" });
-  }
-  const { email, password } = parsed.data;
-  const user = db
-    .prepare("SELECT id, password_hash FROM users WHERE id = ?")
-    .get(req.user.id);
-  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-    return res.status(401).json({ message: "パスワードが違います。" });
-  }
-  const duplicate = db
-    .prepare("SELECT id FROM users WHERE email = ? AND id <> ?")
-    .get(email.toLowerCase(), req.user.id);
-  if (duplicate) {
-    return res.status(409).json({ message: "そのメールアドレスは既に使用されています。" });
-  }
-  db.prepare("UPDATE users SET email = ? WHERE id = ?").run(email.toLowerCase(), req.user.id);
-  return res.json({ ok: true, email: email.toLowerCase() });
 });
 
 app.delete("/account", authMiddleware, (req, res) => {
@@ -483,4 +452,9 @@ function calculateAge(birthDateText, eventDateText) {
 
 app.listen(port, () => {
   console.log(`Your Memory API listening on http://localhost:${port}`);
+  if (isProd) {
+    console.warn(
+      "[beta] テスト公開モード想定: メール認証なし。RECAPTCHA_SECRET_KEY / VITE_RECAPTCHA_SITE_KEY 推奨。集計は GET /public/metrics"
+    );
+  }
 });

@@ -55,4 +55,13 @@ if (!memoryColumns.some((col) => col.name === "track_id")) {
   db.exec("ALTER TABLE memories ADD COLUMN track_id INTEGER NOT NULL DEFAULT 1;");
 }
 
+db.exec(`
+CREATE TABLE IF NOT EXISTS daily_metrics (
+  day TEXT PRIMARY KEY,
+  registrations INTEGER NOT NULL DEFAULT 0,
+  login_ok INTEGER NOT NULL DEFAULT 0,
+  login_fail INTEGER NOT NULL DEFAULT 0
+);
+`);
+
 module.exports = db;

@@ -21,15 +21,27 @@ function normalizeDateInput(value) {
   return `${m[1]}-${String(m[2]).padStart(2, "0")}-${String(m[3]).padStart(2, "0")}`;
 }
 
+async function getRecaptchaToken(action) {
+  const siteKey = import.meta.env.VITE_RECAPTCHA_SITE_KEY;
+  if (!siteKey || typeof window === "undefined") return "";
+  for (let i = 0; i < 30; i += 1) {
+    if (window.grecaptcha?.execute) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!window.grecaptcha?.execute) return "";
+  try {
+    return await window.grecaptcha.execute(siteKey, { action });
+  } catch {
+    return "";
+  }
+}
+
 function App() {
   const [page, setPage] = useState("home");
   const [mode, setMode] = useState("login");
-  const [auth, setAuth] = useState({ email: "", password: "" });
-  const [registerPhase, setRegisterPhase] = useState("request");
-  const [registerCode, setRegisterCode] = useState("");
+  const [auth, setAuth] = useState({ username: "", password: "" });
   const [token, setToken] = useState(localStorage.getItem("your_memory_token") || "");
   const [userName, setUserName] = useState(localStorage.getItem("your_memory_username") || "");
-  const [userEmail, setUserEmail] = useState(localStorage.getItem("your_memory_email") || "");
   const [userBirthDate, setUserBirthDate] = useState(
     normalizeDateInput(localStorage.getItem("your_memory_birth_date") || "")
   );
@@ -44,7 +56,7 @@ function App() {
   const [showMemoryForm, setShowMemoryForm] = useState(false);
   const [accountForm, setAccountForm] = useState({ username: "", birthDate: "" });
   const [accountDeletePassword, setAccountDeletePassword] = useState("");
-  const [accountEmailForm, setAccountEmailForm] = useState({ email: "", password: "" });
+  const [publicMetrics, setPublicMetrics] = useState(null);
   const [lineVisible, setLineVisible] = useState(false);
   const [titleVisible, setTitleVisible] = useState(false);
   const [showPeriodPanel, setShowPeriodPanel] = useState(false);
@@ -120,9 +132,38 @@ function App() {
     return `${oldest.getFullYear()}-${String(oldest.getMonth() + 1).padStart(2, "0")}-${String(oldest.getDate()).padStart(2, "0")}`;
   }, [tracks, userBirthDate]);
   const tracksStorageKey = useMemo(() => {
-    const key = userEmail || "guest";
+    const key = (userName || "guest").toLowerCase();
     return `your_memory_tracks_${key}`;
-  }, [userEmail]);
+  }, [userName]);
+
+  useEffect(() => {
+    const siteKey = import.meta.env.VITE_RECAPTCHA_SITE_KEY;
+    if (!siteKey) return;
+    const elId = "recaptcha-v3-script";
+    if (document.getElementById(elId)) return;
+    const s = document.createElement("script");
+    s.id = elId;
+    s.src = `https://www.google.com/recaptcha/api.js?render=${encodeURIComponent(siteKey)}`;
+    s.async = true;
+    document.head.appendChild(s);
+  }, []);
+
+  useEffect(() => {
+    if (page !== "account") return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API_URL}/public/metrics`);
+        const data = await res.json();
+        if (!cancelled) setPublicMetrics(data);
+      } catch {
+        if (!cancelled) setPublicMetrics(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [page]);
 
   const request = useCallback(async (path, options = {}) => {
     const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
@@ -239,68 +280,34 @@ function App() {
     setError("");
     setMessage("");
     try {
-      let data;
-      if (mode === "register") {
-        if (registerPhase === "request") {
-          const requestData = await request("/auth/register/request-code", {
-            method: "POST",
-            body: JSON.stringify(auth),
-          });
-          if (requestData.debugCode) {
-            setMessage(`認証コード送信（開発表示）: ${requestData.debugCode}`);
-          } else {
-            setMessage("認証コードをメールに送信しました。");
-          }
-          setRegisterPhase("verify");
-          return;
-        }
-        data = await request("/auth/register/verify-code", {
-          method: "POST",
-          body: JSON.stringify({ email: auth.email, code: registerCode }),
-        });
-      } else {
-        data = await request("/auth/login", {
-          method: "POST",
-          body: JSON.stringify(auth),
-        });
+      const action = mode === "register" ? "register" : "login";
+      const recaptchaToken = await getRecaptchaToken(action);
+      const body = { ...auth, recaptchaToken };
+      const path = mode === "register" ? "/auth/register" : "/auth/login";
+      const method = mode === "register" ? "POST" : "POST";
+      const res = await fetch(`${API_URL}${path}`, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.message || "エラーが発生しました。");
       }
       setToken(data.token);
       setUserName(data.user.username || "");
-      setUserEmail(data.user.email);
       const normalizedBirthDate = normalizeDateInput(data.user.birthDate || "");
       setUserBirthDate(normalizedBirthDate);
       setAccountForm({ username: data.user.username || "", birthDate: normalizedBirthDate });
-      setAccountEmailForm((prev) => ({ ...prev, email: data.user.email || "" }));
       setTracks((prev) =>
         prev.map((t) => (t.id === 1 ? { ...t, birthDate: t.birthDate || normalizedBirthDate || "" } : t))
       );
       localStorage.setItem("your_memory_token", data.token);
       localStorage.setItem("your_memory_username", data.user.username || "");
-      localStorage.setItem("your_memory_email", data.user.email);
       localStorage.setItem("your_memory_birth_date", normalizedBirthDate || "");
-      setMessage("ログインしました。");
+      setMessage(mode === "register" ? "登録してログインしました。" : "ログインしました。");
       setPage("home");
-      setRegisterCode("");
-      setRegisterPhase("request");
-    } catch (e) {
-      setError(e.message);
-    }
-  }
-
-  async function resendRegisterCode() {
-    setError("");
-    setMessage("");
-    try {
-      const requestData = await request("/auth/register/request-code", {
-        method: "POST",
-        body: JSON.stringify(auth),
-      });
-      if (requestData.debugCode) {
-        setMessage(`認証コード再送（開発表示）: ${requestData.debugCode}`);
-      } else {
-        setMessage("認証コードを再送しました。");
-      }
-      setRegisterPhase("verify");
+      setAuth({ username: "", password: "" });
     } catch (e) {
       setError(e.message);
     }
@@ -369,9 +376,7 @@ function App() {
       const data = await request("/account");
       const normalizedBirthDate = normalizeDateInput(data.user.birthDate || "");
       setAccountForm({ username: data.user.username || "", birthDate: normalizedBirthDate });
-      setAccountEmailForm((prev) => ({ ...prev, email: data.user.email || "" }));
       setUserName(data.user.username || "");
-      setUserEmail(data.user.email || "");
       setUserBirthDate(normalizedBirthDate);
       localStorage.setItem("your_memory_username", data.user.username || "");
       localStorage.setItem("your_memory_birth_date", normalizedBirthDate);
@@ -398,24 +403,6 @@ function App() {
     }
   }
 
-  async function handleAccountEmailUpdate(e) {
-    e.preventDefault();
-    setError("");
-    setMessage("");
-    try {
-      const data = await request("/account/email", {
-        method: "PUT",
-        body: JSON.stringify(accountEmailForm),
-      });
-      setUserEmail(data.email);
-      localStorage.setItem("your_memory_email", data.email);
-      setAccountEmailForm((prev) => ({ ...prev, password: "" }));
-      setMessage("メールアドレスを更新しました。");
-    } catch (e) {
-      setError(e.message);
-    }
-  }
-
   async function handleAccountDelete(e) {
     e.preventDefault();
     setError("");
@@ -432,10 +419,8 @@ function App() {
   function logout() {
     setToken("");
     setUserName("");
-    setUserEmail("");
     setUserBirthDate("");
     setMemories([]);
-    setAccountEmailForm({ email: "", password: "" });
     localStorage.removeItem("your_memory_token");
     localStorage.removeItem("your_memory_username");
     localStorage.removeItem("your_memory_email");
@@ -444,6 +429,7 @@ function App() {
 
   function openAuthPage(targetMode) {
     setMode(targetMode);
+    setAuth({ username: "", password: "" });
     setPage("auth");
   }
 
@@ -664,14 +650,26 @@ function App() {
             <p className="lead glass-subtitle subtitle-reveal">時間軸に、あなたの思い出を点として残すサービス。</p>
           </header>
           <h2 className="auth-title">{mode === "login" ? "ログイン" : "新規登録"}</h2>
+          <p className="auth-test-notice">
+            現在は<strong>テスト公開</strong>です。メール認証は行いません（ログイン名とパスワードのみ）。レート制限・ボット対策（reCAPTCHA
+            は任意）・ログ監視を行っていますが、パスワード紛失時の<strong>アカウント復旧は提供できません</strong>。データ消失のリスクもあります。
+          </p>
           <form onSubmit={handleAuthSubmit} className="card form auth-card">
             <label>
-              メールアドレス
+              ログイン名（英数字とアンダースコア、2〜32文字）
               <input
-                type="email"
+                type="text"
                 required
-                value={auth.email}
-                onChange={(e) => setAuth((prev) => ({ ...prev, email: e.target.value }))}
+                minLength={2}
+                maxLength={32}
+                pattern="[a-zA-Z0-9_]+"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                value={auth.username}
+                onChange={(e) =>
+                  setAuth((prev) => ({ ...prev, username: e.target.value.replace(/[^a-zA-Z0-9_]/g, "") }))
+                }
               />
             </label>
             <label>
@@ -684,32 +682,11 @@ function App() {
                 onChange={(e) => setAuth((prev) => ({ ...prev, password: e.target.value }))}
               />
             </label>
-            {mode === "register" && registerPhase === "request" && (
-              <p className="auth-step-hint">
-                「認証コード送信」が成功すると、下に認証コード入力欄が表示されます。失敗した場合はメッセージを確認してください。
-              </p>
-            )}
-            {mode === "register" && registerPhase === "verify" && (
-              <label>
-                認証コード（6桁）
-                <input
-                  inputMode="numeric"
-                  pattern="[0-9]{6}"
-                  required
-                  value={registerCode}
-                  onChange={(e) => setRegisterCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-                />
-              </label>
-            )}
+            <p className="auth-step-hint">
+              過去にメールで登録したアカウントは、<strong>ログイン名</strong>（または登録メールアドレス）とパスワードでログインできます。
+            </p>
             <div className="auth-actions">
-              <button type="submit">
-                {mode === "login" ? "ログイン" : registerPhase === "request" ? "認証コード送信" : "認証して登録"}
-              </button>
-              {mode === "register" && registerPhase === "verify" && (
-                <button type="button" onClick={resendRegisterCode}>
-                  再度送信
-                </button>
-              )}
+              <button type="submit">{mode === "login" ? "ログイン" : "登録する"}</button>
               <button type="button" onClick={() => setPage("home")}>
                 ホームへ戻る
               </button>
@@ -721,8 +698,7 @@ function App() {
                 className="auth-switch-link"
                 onClick={() => {
                   setMode((prev) => (prev === "login" ? "register" : "login"));
-                  setRegisterPhase("request");
-                  setRegisterCode("");
+                  setAuth({ username: "", password: "" });
                 }}
               >
                 {mode === "login" ? "新規登録へ切替" : "ログインへ切替"}
@@ -944,29 +920,43 @@ function App() {
           </form>
         </section>
         <section className="card">
-          <h2>メールアドレス変更</h2>
-          <form onSubmit={handleAccountEmailUpdate} className="form">
-            <label>
-              新しいメールアドレス
-              <input
-                type="email"
-                required
-                value={accountEmailForm.email}
-                onChange={(e) => setAccountEmailForm((prev) => ({ ...prev, email: e.target.value }))}
-              />
-            </label>
-            <label>
-              パスワード確認
-              <input
-                type="password"
-                required
-                minLength={8}
-                value={accountEmailForm.password}
-                onChange={(e) => setAccountEmailForm((prev) => ({ ...prev, password: e.target.value }))}
-              />
-            </label>
-            <button type="submit">メールアドレスを更新</button>
-          </form>
+          <h2>テスト運用メトリクス（公開）</h2>
+          <p className="auth-step-hint">
+            本番判断用の集計です（個人を特定する情報は含みません）。<code>GET /public/metrics</code> と同じ内容です。
+          </p>
+          {publicMetrics ? (
+            <>
+              <p>
+                <strong>累計ユーザー数:</strong> {publicMetrics.totalUsers}
+              </p>
+              {Array.isArray(publicMetrics.days) && publicMetrics.days.length > 0 ? (
+                <table className="metrics-table">
+                  <thead>
+                    <tr>
+                      <th>日付（UTC）</th>
+                      <th>新規登録</th>
+                      <th>ログイン成功</th>
+                      <th>ログイン失敗</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {publicMetrics.days.map((row) => (
+                      <tr key={row.day}>
+                        <td>{row.day}</td>
+                        <td>{row.registrations}</td>
+                        <td>{row.login_ok}</td>
+                        <td>{row.login_fail}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <p>日次データはまだありません。</p>
+              )}
+            </>
+          ) : (
+            <p>読み込み中…</p>
+          )}
         </section>
         <section className="card">
           <h2>アカウント削除</h2>
@@ -1008,7 +998,7 @@ function App() {
           />
         </div>
         <div className="user">
-          <span>{userName || userEmail.split("@")[0] || "ユーザー"}</span>
+          <span>{userName || "ユーザー"}</span>
           <button onClick={async () => { await loadAccount(); setPage("account"); }}>マイアカウント</button>
           <button onClick={logout}>ログアウト</button>
         </div>
@@ -1138,12 +1128,12 @@ function App() {
             週次
           </button>
           <div className="color-menu">
-            <button
+        <button
               className={`birth-node-toggle-button ${birthNodeMode !== "off" ? "active" : ""}`}
               onClick={() => setShowBirthNodePanel((v) => !v)}
-            >
+        >
               生年月日ノード: {birthNodeMode === "off" ? "非表示" : birthNodeMode === "all" ? "毎年" : `${birthNodeMode}歳ごと`}
-            </button>
+        </button>
             {showBirthNodePanel && (
               <div className="color-panel birth-node-panel">
                 <button type="button" onClick={() => setBirthNodeMode("off")}>非表示</button>
@@ -1224,7 +1214,7 @@ function App() {
                 </button>
               </div>
             )}
-          </div>
+        </div>
           <div
             className="timeline-scroll"
             ref={(el) => {
