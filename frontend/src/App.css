@@ -371,6 +371,13 @@ select {
   text-shadow: 0 0 6px rgba(230, 249, 255, 0.72);
 }
 
+.auth-step-hint {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: #4a5f7a;
+}
+
 .auth-switch {
   margin: 2px 0 0;
   font-size: 13px;

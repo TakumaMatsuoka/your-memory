@@ -100,16 +100,26 @@ const accountDeleteSchema = z.object({
 const pendingRegisterMap = new Map();
 const registerCodeTtlMs = 10 * 60 * 1000;
 
+function smtpLookup(hostname, _options, callback) {
+  // nodemailer の transport 直下の family は効かない環境があるため、DNS を IPv4 のみに固定する。
+  dns.lookup(hostname, { family: 4 }, callback);
+}
+
 function buildMailer() {
   if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
     return null;
   }
   const smtpTimeoutMs = Number(process.env.SMTP_TIMEOUT_MS || 15000);
+  const host = process.env.SMTP_HOST;
   return nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
+    host,
     port: Number(process.env.SMTP_PORT || 587),
     secure: String(process.env.SMTP_SECURE || "false") === "true",
     family: 4,
+    lookup: smtpLookup,
+    tls: {
+      servername: host,
+    },
     connectionTimeout: smtpTimeoutMs,
     greetingTimeout: smtpTimeoutMs,
     socketTimeout: smtpTimeoutMs,

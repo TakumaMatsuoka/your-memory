@@ -287,6 +287,25 @@ function App() {
     }
   }
 
+  async function resendRegisterCode() {
+    setError("");
+    setMessage("");
+    try {
+      const requestData = await request("/auth/register/request-code", {
+        method: "POST",
+        body: JSON.stringify(auth),
+      });
+      if (requestData.debugCode) {
+        setMessage(`認証コード再送（開発表示）: ${requestData.debugCode}`);
+      } else {
+        setMessage("認証コードを再送しました。");
+      }
+      setRegisterPhase("verify");
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
   async function handleMemorySubmit(e) {
     e.preventDefault();
     setError("");
@@ -665,6 +684,11 @@ function App() {
                 onChange={(e) => setAuth((prev) => ({ ...prev, password: e.target.value }))}
               />
             </label>
+            {mode === "register" && registerPhase === "request" && (
+              <p className="auth-step-hint">
+                「認証コード送信」が成功すると、下に認証コード入力欄が表示されます。失敗した場合はメッセージを確認してください。
+              </p>
+            )}
             {mode === "register" && registerPhase === "verify" && (
               <label>
                 認証コード（6桁）
@@ -681,6 +705,11 @@ function App() {
               <button type="submit">
                 {mode === "login" ? "ログイン" : registerPhase === "request" ? "認証コード送信" : "認証して登録"}
               </button>
+              {mode === "register" && registerPhase === "verify" && (
+                <button type="button" onClick={resendRegisterCode}>
+                  再度送信
+                </button>
+              )}
               <button type="button" onClick={() => setPage("home")}>
                 ホームへ戻る
               </button>
