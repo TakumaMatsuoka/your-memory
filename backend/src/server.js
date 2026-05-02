@@ -1,6 +1,7 @@
 require("dotenv").config();
 
 const dns = require("dns");
+const net = require("net");
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
@@ -100,25 +101,37 @@ const accountDeleteSchema = z.object({
 const pendingRegisterMap = new Map();
 const registerCodeTtlMs = 10 * 60 * 1000;
 
-function smtpLookup(hostname, _options, callback) {
-  // nodemailer の transport 直下の family は効かない環境があるため、DNS を IPv4 のみに固定する。
-  dns.lookup(hostname, { family: 4 }, callback);
-}
-
-function buildMailer() {
-  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+/**
+ * Railway 等で IPv6 経路が使えず ENETUNREACH になるため、ホスト名は A レコードで IPv4 に解決してから接続する。
+ * TLS 証明書検証用に servername は元のホスト名のまま渡す。
+ */
+async function createSmtpTransporter() {
+  const rawHost = (process.env.SMTP_HOST || "").trim();
+  if (!rawHost || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
     return null;
   }
   const smtpTimeoutMs = Number(process.env.SMTP_TIMEOUT_MS || 15000);
-  const host = process.env.SMTP_HOST;
+  let connectHost = rawHost;
+  let servername = rawHost;
+
+  if (!net.isIP(rawHost)) {
+    try {
+      const v4 = await dns.promises.resolve4(rawHost);
+      if (v4?.length) {
+        connectHost = v4[0];
+        servername = rawHost;
+      }
+    } catch (err) {
+      console.warn("[smtp] resolve4 failed, connecting by hostname:", err?.message || err);
+    }
+  }
+
   return nodemailer.createTransport({
-    host,
+    host: connectHost,
     port: Number(process.env.SMTP_PORT || 587),
     secure: String(process.env.SMTP_SECURE || "false") === "true",
-    family: 4,
-    lookup: smtpLookup,
     tls: {
-      servername: host,
+      servername,
     },
     connectionTimeout: smtpTimeoutMs,
     greetingTimeout: smtpTimeoutMs,
@@ -131,7 +144,7 @@ function buildMailer() {
 }
 
 async function sendVerificationEmail(email, code) {
-  const transporter = buildMailer();
+  const transporter = await createSmtpTransporter();
   if (!transporter) {
     console.log(`[register-code] ${email}: ${code}`);
     return false;
